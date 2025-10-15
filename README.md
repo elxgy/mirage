@@ -128,7 +128,3 @@ make run      # Build and run example
 
 - Go 1.21+
 - Linux/macOS
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file.
