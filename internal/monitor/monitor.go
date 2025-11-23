@@ -57,21 +57,25 @@ type LoadMetrics struct {
 	Load15 float64
 }
 
-type Monitor struct {
+type SystemMonitor struct {
 	interval    time.Duration
 	metrics     []SystemMetrics
 	metricsPool *sync.Pool
 	mutex       sync.RWMutex
 	isRunning   bool
 	stopChan    chan struct{}
-	initialDisk *disk.IOCountersStat
-	initialNet  map[string]net.IOCountersStat
-	maxSamples  int
+
+	// Baselines for delta calculation
+	lastDisk    map[string]disk.IOCountersStat
+	lastNet     map[string]net.IOCountersStat
+	hasBaseline bool
+
+	maxSamples int
 }
 
-func New(interval time.Duration) *Monitor {
+func NewSystemMonitor(interval time.Duration) *SystemMonitor {
 	const defaultMaxSamples = 10000
-	return &Monitor{
+	return &SystemMonitor{
 		interval:   interval,
 		metrics:    make([]SystemMetrics, 0, 128),
 		stopChan:   make(chan struct{}),
@@ -89,7 +93,7 @@ func New(interval time.Duration) *Monitor {
 	}
 }
 
-func (m *Monitor) Start(ctx context.Context) error {
+func (m *SystemMonitor) Start(ctx context.Context) error {
 	m.mutex.Lock()
 	if m.isRunning {
 		m.mutex.Unlock()
@@ -98,9 +102,8 @@ func (m *Monitor) Start(ctx context.Context) error {
 	m.isRunning = true
 	m.mutex.Unlock()
 
-	if err := m.initializeBaselines(); err != nil {
-		return err
-	}
+	// Initialize baselines
+	m.collectMetrics()
 
 	ticker := time.NewTicker(m.interval)
 	defer ticker.Stop()
@@ -117,17 +120,20 @@ func (m *Monitor) Start(ctx context.Context) error {
 				continue
 			}
 
-			m.mutex.Lock()
-			if len(m.metrics) >= m.maxSamples {
-				m.metrics = m.metrics[len(m.metrics)/2:]
+			// Only append if we have valid deltas (after first run)
+			if metrics != nil {
+				m.mutex.Lock()
+				if len(m.metrics) >= m.maxSamples {
+					m.metrics = m.metrics[len(m.metrics)/2:]
+				}
+				m.metrics = append(m.metrics, *metrics)
+				m.mutex.Unlock()
 			}
-			m.metrics = append(m.metrics, *metrics)
-			m.mutex.Unlock()
 		}
 	}
 }
 
-func (m *Monitor) Stop() {
+func (m *SystemMonitor) Stop() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -137,7 +143,7 @@ func (m *Monitor) Stop() {
 	}
 }
 
-func (m *Monitor) GetMetrics() []SystemMetrics {
+func (m *SystemMonitor) GetMetrics() []SystemMetrics {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -146,7 +152,7 @@ func (m *Monitor) GetMetrics() []SystemMetrics {
 	return metrics
 }
 
-func (m *Monitor) GetLatestMetrics() *SystemMetrics {
+func (m *SystemMonitor) GetLatestMetrics() *SystemMetrics {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -158,7 +164,7 @@ func (m *Monitor) GetLatestMetrics() *SystemMetrics {
 	return &latest
 }
 
-func (m *Monitor) GetAverageMetrics() *SystemMetrics {
+func (m *SystemMonitor) GetAverageMetrics() *SystemMetrics {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -227,32 +233,11 @@ func (m *Monitor) GetAverageMetrics() *SystemMetrics {
 	return avg
 }
 
-func (m *Monitor) initializeBaselines() error {
-
-	diskStats, err := disk.IOCounters()
-	if err == nil && len(diskStats) > 0 {
-
-		for _, stat := range diskStats {
-			m.initialDisk = &stat
-			break
-		}
-	}
-
-	netStats, err := net.IOCounters(false)
-	if err == nil && len(netStats) > 0 {
-		m.initialNet = make(map[string]net.IOCountersStat)
-		for _, stat := range netStats {
-			m.initialNet[stat.Name] = stat
-		}
-	}
-
-	return nil
-}
-
-func (m *Monitor) collectMetrics() (*SystemMetrics, error) {
+func (m *SystemMonitor) collectMetrics() (*SystemMetrics, error) {
 	metrics := m.metricsPool.Get().(*SystemMetrics)
 	metrics.Timestamp = time.Now()
 
+	// CPU
 	cpuPercents, err := cpu.Percent(0, true)
 	if err == nil {
 		if metrics.CPUPercent == nil || len(metrics.CPUPercent) != len(cpuPercents) {
@@ -261,6 +246,7 @@ func (m *Monitor) collectMetrics() (*SystemMetrics, error) {
 		copy(metrics.CPUPercent, cpuPercents)
 	}
 
+	// Memory
 	memStats, err := mem.VirtualMemory()
 	if err == nil {
 		metrics.MemoryUsage.Total = memStats.Total
@@ -272,46 +258,69 @@ func (m *Monitor) collectMetrics() (*SystemMetrics, error) {
 		metrics.MemoryUsage.Cached = memStats.Cached
 	}
 
+	// Disk (Delta)
 	diskStats, err := disk.IOCounters()
-	if err == nil && len(diskStats) > 0 {
+	if err == nil {
 		metrics.DiskUsage.ReadBytes = 0
 		metrics.DiskUsage.WriteBytes = 0
 		metrics.DiskUsage.ReadCount = 0
 		metrics.DiskUsage.WriteCount = 0
-		metrics.DiskUsage.ReadTime = 0
-		metrics.DiskUsage.WriteTime = 0
-		for _, stat := range diskStats {
-			metrics.DiskUsage.ReadBytes += stat.ReadBytes
-			metrics.DiskUsage.WriteBytes += stat.WriteBytes
-			metrics.DiskUsage.ReadCount += stat.ReadCount
-			metrics.DiskUsage.WriteCount += stat.WriteCount
-			metrics.DiskUsage.ReadTime += stat.ReadTime
-			metrics.DiskUsage.WriteTime += stat.WriteTime
+
+		currentDisk := make(map[string]disk.IOCountersStat)
+		for name, stat := range diskStats {
+			currentDisk[name] = stat
+			if m.hasBaseline {
+				if last, ok := m.lastDisk[name]; ok {
+					if stat.ReadBytes >= last.ReadBytes {
+						metrics.DiskUsage.ReadBytes += stat.ReadBytes - last.ReadBytes
+					}
+					if stat.WriteBytes >= last.WriteBytes {
+						metrics.DiskUsage.WriteBytes += stat.WriteBytes - last.WriteBytes
+					}
+					if stat.ReadCount >= last.ReadCount {
+						metrics.DiskUsage.ReadCount += stat.ReadCount - last.ReadCount
+					}
+					if stat.WriteCount >= last.WriteCount {
+						metrics.DiskUsage.WriteCount += stat.WriteCount - last.WriteCount
+					}
+				}
+			}
 		}
+		m.lastDisk = currentDisk
 	}
 
+	// Network (Delta)
 	netStats, err := net.IOCounters(false)
-	if err == nil && len(netStats) > 0 {
+	if err == nil {
 		metrics.NetworkUsage.BytesSent = 0
 		metrics.NetworkUsage.BytesRecv = 0
 		metrics.NetworkUsage.PacketsSent = 0
 		metrics.NetworkUsage.PacketsRecv = 0
-		metrics.NetworkUsage.ErrorsIn = 0
-		metrics.NetworkUsage.ErrorsOut = 0
-		metrics.NetworkUsage.DroppedIn = 0
-		metrics.NetworkUsage.DroppedOut = 0
+
+		currentNet := make(map[string]net.IOCountersStat)
 		for _, stat := range netStats {
-			metrics.NetworkUsage.BytesSent += stat.BytesSent
-			metrics.NetworkUsage.BytesRecv += stat.BytesRecv
-			metrics.NetworkUsage.PacketsSent += stat.PacketsSent
-			metrics.NetworkUsage.PacketsRecv += stat.PacketsRecv
-			metrics.NetworkUsage.ErrorsIn += stat.Errin
-			metrics.NetworkUsage.ErrorsOut += stat.Errout
-			metrics.NetworkUsage.DroppedIn += stat.Dropin
-			metrics.NetworkUsage.DroppedOut += stat.Dropout
+			currentNet[stat.Name] = stat
+			if m.hasBaseline {
+				if last, ok := m.lastNet[stat.Name]; ok {
+					if stat.BytesSent >= last.BytesSent {
+						metrics.NetworkUsage.BytesSent += stat.BytesSent - last.BytesSent
+					}
+					if stat.BytesRecv >= last.BytesRecv {
+						metrics.NetworkUsage.BytesRecv += stat.BytesRecv - last.BytesRecv
+					}
+					if stat.PacketsSent >= last.PacketsSent {
+						metrics.NetworkUsage.PacketsSent += stat.PacketsSent - last.PacketsSent
+					}
+					if stat.PacketsRecv >= last.PacketsRecv {
+						metrics.NetworkUsage.PacketsRecv += stat.PacketsRecv - last.PacketsRecv
+					}
+				}
+			}
 		}
+		m.lastNet = currentNet
 	}
 
+	// Load Average
 	loadStats, err := load.Avg()
 	if err == nil {
 		metrics.LoadAverage.Load1 = loadStats.Load1
@@ -319,10 +328,15 @@ func (m *Monitor) collectMetrics() (*SystemMetrics, error) {
 		metrics.LoadAverage.Load15 = loadStats.Load15
 	}
 
+	if !m.hasBaseline {
+		m.hasBaseline = true
+		return nil, nil // Skip first sample as it's just baseline
+	}
+
 	return metrics, nil
 }
 
-func (m *Monitor) GetPeakMetrics() *SystemMetrics {
+func (m *SystemMonitor) GetPeakMetrics() *SystemMetrics {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 

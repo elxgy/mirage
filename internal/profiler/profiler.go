@@ -3,6 +3,7 @@ package profiler
 import (
 	"context"
 	"fmt"
+	"mirage/internal/monitor"
 	"os"
 	"os/exec"
 	"runtime"
@@ -14,17 +15,18 @@ import (
 )
 
 type ProfileData struct {
-	Command      string
-	Args         []string
-	StartTime    time.Time
-	EndTime      time.Time
-	Duration     time.Duration
-	ExitCode     int
-	CPUProfile   *CPUProfileData
-	MemProfile   *MemoryProfileData
-	ProcessStats *ProcessStats
-	SystemStats  *SystemStats
-	StackTraces  []string
+	Command        string
+	Args           []string
+	StartTime      time.Time
+	EndTime        time.Time
+	Duration       time.Duration
+	ExitCode       int
+	CPUProfile     *CPUProfileData
+	MemProfile     *MemoryProfileData
+	ProcessStats   *ProcessStats
+	SystemStats    *SystemStats
+	StackTraces    []string
+	ProcessMetrics []monitor.ProcessMetrics
 }
 
 type CPUProfileData struct {
@@ -65,12 +67,12 @@ type Profiler struct {
 	monitorInterval  time.Duration
 }
 
-func New(enableCPU, enableMem bool, profileDir string) *Profiler {
+func New(enableCPU, enableMem bool, profileDir string, monitorInterval time.Duration) *Profiler {
 	return &Profiler{
 		enableCPUProfile: enableCPU,
 		enableMemProfile: enableMem,
 		profileDir:       profileDir,
-		monitorInterval:  50 * time.Millisecond,
+		monitorInterval:  monitorInterval,
 	}
 }
 
@@ -108,19 +110,30 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 		return data, fmt.Errorf("failed to start command: %v", err)
 	}
 
-	proc, err := process.NewProcess(int32(cmd.Process.Pid))
-	if err != nil {
-		return data, fmt.Errorf("failed to get process info: %v", err)
+	// Start Process Monitor
+	procMon := monitor.NewProcessMonitor(int32(cmd.Process.Pid), p.monitorInterval)
+	procMonCtx, procMonCancel := context.WithCancel(ctx)
+
+	monitorDone := make(chan error, 1)
+	go func() {
+		monitorDone <- procMon.Start(procMonCtx)
+	}()
+
+	err := cmd.Wait()
+
+	// Stop Process Monitor
+	procMonCancel()
+	procMon.Stop()
+
+	// Wait for monitor to finish
+	select {
+	case <-monitorDone:
+	case <-time.After(500 * time.Millisecond):
 	}
-
-	monitorDone := make(chan struct{})
-	go p.monitorProcess(proc, data, monitorDone)
-
-	err = cmd.Wait()
-	close(monitorDone)
 
 	data.EndTime = time.Now()
 	data.Duration = data.EndTime.Sub(data.StartTime)
+	data.ProcessMetrics = procMon.GetMetrics()
 
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
@@ -165,58 +178,6 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 	return data, nil
 }
 
-func (p *Profiler) monitorProcess(proc *process.Process, data *ProfileData, done <-chan struct{}) {
-	ticker := time.NewTicker(p.monitorInterval)
-	defer ticker.Stop()
-
-	var maxRSS, maxVMS uint64
-	var sampleCount int
-
-	if data.MemProfile == nil {
-		data.MemProfile = &MemoryProfileData{}
-	}
-	if data.ProcessStats == nil {
-		data.ProcessStats = &ProcessStats{PID: proc.Pid}
-	}
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			sampleCount++
-
-			memInfo, err := proc.MemoryInfo()
-			if err != nil {
-				continue
-			}
-
-			if memInfo.RSS > maxRSS {
-				maxRSS = memInfo.RSS
-				data.MemProfile.PeakRSS = maxRSS
-			}
-			if memInfo.VMS > maxVMS {
-				maxVMS = memInfo.VMS
-				data.MemProfile.PeakVMS = maxVMS
-			}
-
-			if sampleCount%10 == 0 {
-				if numThreads, err := proc.NumThreads(); err == nil {
-					data.ProcessStats.NumThreads = numThreads
-				}
-
-				if numFDs, err := proc.NumFDs(); err == nil {
-					data.ProcessStats.NumFDs = numFDs
-				}
-
-				if ctxSwitches, err := proc.NumCtxSwitches(); err == nil {
-					data.ProcessStats.ContextSwitches = ctxSwitches
-				}
-			}
-		}
-	}
-}
-
 func (p *Profiler) getFinalStats(cmd *exec.Cmd, data *ProfileData) error {
 	if cmd.ProcessState == nil {
 		return nil
@@ -242,6 +203,16 @@ func (p *Profiler) getFinalStats(cmd *exec.Cmd, data *ProfileData) error {
 		data.MemProfile.PeakRSS = uint64(rusage.Maxrss) * 1024
 		data.MemProfile.MinorFaults = uint64(rusage.Minflt)
 		data.MemProfile.MajorFaults = uint64(rusage.Majflt)
+	}
+
+	// Fill ProcessStats from the last metric if available
+	if len(data.ProcessMetrics) > 0 {
+		lastMetric := data.ProcessMetrics[len(data.ProcessMetrics)-1]
+		data.ProcessStats = &ProcessStats{
+			PID:        int32(cmd.Process.Pid),
+			NumThreads: lastMetric.ThreadCount,
+			NumFDs:     lastMetric.FileDescriptors,
+		}
 	}
 
 	return nil

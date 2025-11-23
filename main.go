@@ -97,8 +97,8 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 		fmt.Printf("Monitoring frequency: %s\n", *monitorFreq)
 	}
 
-	prof := profiler.New(*enableCPU, *enableMem, *profileDir)
-	mon := monitor.New(*monitorFreq)
+	prof := profiler.New(*enableCPU, *enableMem, *profileDir, *monitorFreq)
+	mon := monitor.NewSystemMonitor(*monitorFreq)
 
 	monitorCtx, monitorCancel := context.WithCancel(ctx)
 	defer monitorCancel()
@@ -112,6 +112,8 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 
 	if *verbose {
 		fmt.Printf("Executing command: %s\n", command)
+	} else {
+		fmt.Printf("Profiling %s...\n", command)
 	}
 
 	profileData, err := prof.Profile(ctx, command, args...)
@@ -138,6 +140,8 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 		fmt.Printf("Command executed in: %s\n", profileData.Duration)
 		fmt.Printf("Exit code: %d\n", profileData.ExitCode)
 	}
+
+	fmt.Print("\n\n") // Separate process output from report
 
 	if err := generateReport(profileData, systemMetrics); err != nil {
 		return fmt.Errorf("failed to generate report: %v", err)
