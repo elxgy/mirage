@@ -3,7 +3,10 @@ package profiler
 import (
 	"context"
 	"fmt"
+	"mirage/internal/cgroup"
 	"mirage/internal/monitor"
+	"mirage/internal/sampler"
+	"mirage/internal/syscalltrace"
 	"os"
 	"os/exec"
 	"runtime"
@@ -26,7 +29,17 @@ type ProfileData struct {
 	SystemStats    *SystemStats
 	ProcessMetrics []monitor.ProcessMetrics
 	TracePath      string
-	MutexPath      string
+	MutexPath       string
+	CgroupStats     *cgroup.Stats
+	SyscallSummary     []syscalltrace.SyscallStat
+	TopSyscallsSampled []sampler.SyscallCount
+	TargetPprofPath    string
+	TargetPprofTop     []PprofTopEntry
+}
+
+type PprofTopEntry struct {
+	Name  string
+	Value int64
 }
 
 type CPUProfileData struct {
@@ -60,19 +73,25 @@ type Profiler struct {
 	enableMemProfile bool
 	enableTrace      bool
 	enableMutex      bool
+	enableCgroup     bool
+	enableStrace     bool
+	enableSample     bool
 	profileDir       string
 	monitorInterval  time.Duration
 	metricsCallback  func(monitor.ProcessMetrics)
 }
 
-func NewWithTraceMutex(enableCPU, enableMem, enableTrace, enableMutex bool, profileDir string, monitorInterval time.Duration) *Profiler {
+func NewWithTraceMutex(enableCPU, enableMem, enableTrace, enableMutex, enableCgroup, enableStrace, enableSample bool, profileDir string, monitorInterval time.Duration) *Profiler {
 	return &Profiler{
 		enableCPUProfile: enableCPU,
 		enableMemProfile: enableMem,
-		enableTrace:       enableTrace,
+		enableTrace:      enableTrace,
 		enableMutex:      enableMutex,
-		profileDir:        profileDir,
-		monitorInterval:   monitorInterval,
+		enableCgroup:     enableCgroup,
+		enableStrace:     enableStrace,
+		enableSample:     enableSample,
+		profileDir:       profileDir,
+		monitorInterval:  monitorInterval,
 	}
 }
 
@@ -128,6 +147,32 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 		return data, fmt.Errorf("failed to start command: %v", err)
 	}
 
+	var cgScope *cgroup.Scope
+	if p.enableCgroup {
+		if scope, err := cgroup.NewScope(cmd.Process.Pid); err == nil {
+			cgScope = scope
+			defer func() { _ = cgScope.Cleanup() }()
+		}
+	}
+
+	var straceSession *syscalltrace.Session
+	if p.enableStrace {
+		if sess, err := syscalltrace.StartAttach(cmd.Process.Pid); err == nil {
+			straceSession = sess
+		}
+	}
+
+	var samp *sampler.Sampler
+	if p.enableSample {
+		samp = sampler.New(cmd.Process.Pid, 10*time.Millisecond)
+		sampCtx, sampCancel := context.WithCancel(ctx)
+		go samp.Run(sampCtx)
+		defer func() {
+			sampCancel()
+			samp.Stop()
+		}()
+	}
+
 	procMon := monitor.NewProcessMonitor(int32(cmd.Process.Pid), p.monitorInterval)
 	if p.metricsCallback != nil {
 		procMon.OnSample = p.metricsCallback
@@ -167,6 +212,22 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 
 	if err := p.getFinalStats(cmd, data); err != nil {
 		return data, fmt.Errorf("failed to get final stats: %v", err)
+	}
+
+	if cgScope != nil {
+		if st, err := cgScope.ReadStats(); err == nil {
+			data.CgroupStats = &st
+		}
+	}
+
+	if straceSession != nil {
+		if summary, err := straceSession.Wait(); err == nil {
+			data.SyscallSummary = summary
+		}
+	}
+
+	if samp != nil {
+		data.TopSyscallsSampled = sampler.TopSyscalls(samp.Samples(), 20)
 	}
 
 	if p.enableMemProfile {

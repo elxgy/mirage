@@ -14,6 +14,7 @@ import (
 	"mirage/internal/analysis"
 	"mirage/internal/monitor"
 	"mirage/internal/pipeline"
+	"mirage/internal/pprofread"
 	"mirage/internal/profiler"
 	"mirage/internal/report"
 	"mirage/internal/ui/tui"
@@ -30,9 +31,13 @@ var (
 	monitorFreq = flag.Duration("freq", 100*time.Millisecond, "System monitoring frequency")
 	timeout     = flag.Duration("timeout", 0, "Maximum execution time (0 = no timeout)")
 	noColor     = flag.Bool("no-color", false, "Disable colored output")
-	format  = flag.String("format", "text", "Report format (text or markdown)")
-	ui      = flag.Bool("ui", false, "Show live TUI dashboard while profiling")
-	help        = flag.Bool("h", false, "Show help message")
+	format      = flag.String("format", "text", "Report format (text or markdown)")
+	ui          = flag.Bool("ui", false, "Show live TUI dashboard while profiling")
+	enableCgroup  = flag.Bool("cgroup", false, "Run target in cgroup v2 scope (Linux); report cgroup I/O and memory")
+	enableStrace  = flag.Bool("strace", false, "Trace syscalls (strace -f -c); report syscall summary (Linux)")
+	enableSample  = flag.Bool("sample", false, "Sample /proc syscall at high frequency; report top syscalls (Linux)")
+	pprofPath     = flag.String("pprof", "", "Parse target-generated pprof file and report top functions (e.g. path to cpu.prof)")
+	help          = flag.Bool("h", false, "Show help message")
 )
 
 const (
@@ -109,7 +114,7 @@ func runTUI(ctx context.Context, command string, args ...string) error {
 	doneChan := make(chan tui.ProfileDoneMsg, 1)
 	resultChan := make(chan tui.ProfileDoneMsg, 1)
 
-	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *profileDir, *monitorFreq)
+	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *enableCgroup, *enableStrace, *enableSample, *profileDir, *monitorFreq)
 	prof.SetMetricsCallback(func(m monitor.ProcessMetrics) {
 		select {
 		case metricsChan <- m:
@@ -178,6 +183,7 @@ func runTUI(ctx context.Context, command string, args ...string) error {
 	session.TracePath = result.Data.TracePath
 	session.MutexPath = result.Data.MutexPath
 
+	attachPprofSummary(session.ProfileData, *pprofPath)
 	pipeline.Normalize(session)
 	pipeline.Analyze(session, analysis.DefaultConfig)
 
@@ -201,7 +207,7 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 		fmt.Printf("Monitoring frequency: %s\n", *monitorFreq)
 	}
 
-	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *profileDir, *monitorFreq)
+	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *enableCgroup, *enableStrace, *enableSample, *profileDir, *monitorFreq)
 	mon := monitor.NewSystemMonitor(*monitorFreq)
 
 	monitorCtx, monitorCancel := context.WithCancel(ctx)
@@ -246,6 +252,7 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 	session.TracePath = profileData.TracePath
 	session.MutexPath = profileData.MutexPath
 
+	attachPprofSummary(session.ProfileData, *pprofPath)
 	pipeline.Normalize(session)
 	pipeline.Analyze(session, analysis.DefaultConfig)
 
@@ -277,6 +284,20 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 	}
 
 	return nil
+}
+
+func attachPprofSummary(data *profiler.ProfileData, path string) {
+	if data == nil || path == "" {
+		return
+	}
+	tops, err := pprofread.TopFunctions(path, 15)
+	if err != nil {
+		return
+	}
+	data.TargetPprofPath = path
+	for _, t := range tops {
+		data.TargetPprofTop = append(data.TargetPprofTop, profiler.PprofTopEntry{Name: t.Name, Value: t.Value})
+	}
 }
 
 func generateReport(session *pipeline.Session) error {

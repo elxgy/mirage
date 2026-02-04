@@ -100,11 +100,14 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 	// Process Metrics
 	if len(profileData.ProcessMetrics) > 0 {
 		r.drawBox("Process Metrics (Target + Children)", func(w io.Writer) {
-			// Calculate averages/peaks
 			var peakCPU float64
-			var peakRSS, peakVMS uint64
 			var totalRead, totalWrite uint64
-
+			peakRSS := uint64(0)
+			peakVMS := uint64(0)
+			if profileData.MemProfile != nil {
+				peakRSS = profileData.MemProfile.PeakRSS
+				peakVMS = profileData.MemProfile.PeakVMS
+			}
 			for _, m := range profileData.ProcessMetrics {
 				if m.CPUPercent > peakCPU {
 					peakCPU = m.CPUPercent
@@ -119,7 +122,6 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 				totalWrite += m.WriteBytes
 			}
 
-			// Get last stats for threads/fds
 			last := profileData.ProcessMetrics[len(profileData.ProcessMetrics)-1]
 
 			r.writeKV(w, "Peak CPU Usage", fmt.Sprintf("%.2f%%", peakCPU), labelColor, valueColor)
@@ -129,6 +131,44 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 			r.writeKV(w, "Total Write", r.formatBytes(totalWrite), labelColor, valueColor)
 			r.writeKV(w, "Active Threads", fmt.Sprintf("%d", last.ThreadCount), labelColor, valueColor)
 			r.writeKV(w, "Open Files", fmt.Sprintf("%d", last.FileDescriptors), labelColor, valueColor)
+		})
+		fmt.Fprintln(r.writer)
+	}
+
+	if profileData.CgroupStats != nil {
+		r.drawBox("Cgroup (v2)", func(w io.Writer) {
+			r.writeKV(w, "Memory (current)", r.formatBytes(profileData.CgroupStats.MemoryCurrent), labelColor, valueColor)
+			var totalRead, totalWrite uint64
+			for _, e := range profileData.CgroupStats.IOStat {
+				totalRead += e.ReadBytes
+				totalWrite += e.WriteBytes
+			}
+			r.writeKV(w, "I/O read", r.formatBytes(totalRead), labelColor, valueColor)
+			r.writeKV(w, "I/O write", r.formatBytes(totalWrite), labelColor, valueColor)
+		})
+		fmt.Fprintln(r.writer)
+	}
+
+	if len(profileData.SyscallSummary) > 0 {
+		r.drawBox("Syscall Summary", func(w io.Writer) {
+			const topN = 15
+			n := len(profileData.SyscallSummary)
+			if n > topN {
+				n = topN
+			}
+			for i := 0; i < n; i++ {
+				s := profileData.SyscallSummary[i]
+				fmt.Fprintf(w, "%-20s %8d calls  %8.3fs total\n", s.Name, s.Count, s.TotalTime)
+			}
+		})
+		fmt.Fprintln(r.writer)
+	}
+
+	if len(profileData.TopSyscallsSampled) > 0 {
+		r.drawBox("Top Syscalls (sampled)", func(w io.Writer) {
+			for _, c := range profileData.TopSyscallsSampled {
+				fmt.Fprintf(w, "%-20s %8d samples\n", c.Name, c.Count)
+			}
 		})
 		fmt.Fprintln(r.writer)
 	}
@@ -153,6 +193,16 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 			}
 			if mutexPath != "" {
 				r.writeKV(w, "Mutex profile", mutexPath+" (go tool pprof)", labelColor, valueColor)
+			}
+		})
+		fmt.Fprintln(r.writer)
+	}
+
+	if profileData.TargetPprofPath != "" {
+		r.drawBox("Target pprof (parsed)", func(w io.Writer) {
+			r.writeKV(w, "File", profileData.TargetPprofPath, labelColor, valueColor)
+			for _, e := range profileData.TargetPprofTop {
+				fmt.Fprintf(w, "%-50s %10d\n", e.Name, e.Value)
 			}
 		})
 		fmt.Fprintln(r.writer)
@@ -333,8 +383,13 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 
 	if len(profileData.ProcessMetrics) > 0 {
 		var peakCPU float64
-		var peakRSS, peakVMS uint64
 		var totalRead, totalWrite uint64
+		peakRSS := uint64(0)
+		peakVMS := uint64(0)
+		if profileData.MemProfile != nil {
+			peakRSS = profileData.MemProfile.PeakRSS
+			peakVMS = profileData.MemProfile.PeakVMS
+		}
 		for _, m := range profileData.ProcessMetrics {
 			if m.CPUPercent > peakCPU {
 				peakCPU = m.CPUPercent
@@ -357,6 +412,44 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 		fmt.Fprintf(w, "- **Total Write:** %s\n", r.formatBytes(totalWrite))
 		fmt.Fprintf(w, "- **Active Threads:** %d\n", last.ThreadCount)
 		fmt.Fprintf(w, "- **Open Files:** %d\n\n", last.FileDescriptors)
+	}
+
+	if profileData.CgroupStats != nil {
+		var totalRead, totalWrite uint64
+		for _, e := range profileData.CgroupStats.IOStat {
+			totalRead += e.ReadBytes
+			totalWrite += e.WriteBytes
+		}
+		fmt.Fprintf(w, "## Cgroup (v2)\n\n")
+		fmt.Fprintf(w, "- **Memory (current):** %s\n", r.formatBytes(profileData.CgroupStats.MemoryCurrent))
+		fmt.Fprintf(w, "- **I/O read:** %s\n", r.formatBytes(totalRead))
+		fmt.Fprintf(w, "- **I/O write:** %s\n\n", r.formatBytes(totalWrite))
+	}
+
+	if len(profileData.SyscallSummary) > 0 {
+		const topN = 15
+		n := len(profileData.SyscallSummary)
+		if n > topN {
+			n = topN
+		}
+		fmt.Fprintf(w, "## Syscall Summary\n\n")
+		fmt.Fprintf(w, "| Syscall | Calls | Total time (s) |\n")
+		fmt.Fprintf(w, "|---------|-------|----------------|\n")
+		for i := 0; i < n; i++ {
+			s := profileData.SyscallSummary[i]
+			fmt.Fprintf(w, "| %s | %d | %.3f |\n", s.Name, s.Count, s.TotalTime)
+		}
+		fmt.Fprintf(w, "\n")
+	}
+
+	if len(profileData.TopSyscallsSampled) > 0 {
+		fmt.Fprintf(w, "## Top Syscalls (sampled)\n\n")
+		fmt.Fprintf(w, "| Syscall | Samples |\n")
+		fmt.Fprintf(w, "|---------|--------|\n")
+		for _, c := range profileData.TopSyscallsSampled {
+			fmt.Fprintf(w, "| %s | %d |\n", c.Name, c.Count)
+		}
+		fmt.Fprintf(w, "\n")
 	}
 
 	if len(systemMetrics) > 0 {
@@ -430,6 +523,16 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 		if mutexPath != "" {
 			fmt.Fprintf(w, "- **Mutex profile:** %s (view with `go tool pprof`)\n", mutexPath)
 		}
+	}
+
+	if profileData.TargetPprofPath != "" {
+		fmt.Fprintf(w, "## Target pprof (parsed)\n\n")
+		fmt.Fprintf(w, "- **File:** %s\n\n", profileData.TargetPprofPath)
+		fmt.Fprintf(w, "| Function | Value |\n|----------|-------|\n")
+		for _, e := range profileData.TargetPprofTop {
+			fmt.Fprintf(w, "| %s | %d |\n", e.Name, e.Value)
+		}
+		fmt.Fprintf(w, "\n")
 	}
 
 	return nil

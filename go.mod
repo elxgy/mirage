@@ -6,6 +6,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/fatih/color v1.18.0
+	github.com/google/pprof v0.0.0-20260202012954-cb029daf43ef
 	github.com/shirou/gopsutil/v3 v3.23.12
 )
 

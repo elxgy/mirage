@@ -30,6 +30,20 @@ func NewSession(command string, args []string) *Session {
 }
 
 func Normalize(s *Session) {
+	if s.ProfileData == nil || len(s.ProfileData.ProcessMetrics) == 0 {
+		return
+	}
+	if s.ProfileData.MemProfile == nil {
+		s.ProfileData.MemProfile = &profiler.MemoryProfileData{}
+	}
+	for _, m := range s.ProfileData.ProcessMetrics {
+		if m.MemoryRSS > s.ProfileData.MemProfile.PeakRSS {
+			s.ProfileData.MemProfile.PeakRSS = m.MemoryRSS
+		}
+		if m.MemoryVMS > s.ProfileData.MemProfile.PeakVMS {
+			s.ProfileData.MemProfile.PeakVMS = m.MemoryVMS
+		}
+	}
 }
 
 func Analyze(s *Session, cfg analysis.Config) {

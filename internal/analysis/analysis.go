@@ -3,6 +3,7 @@ package analysis
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"mirage/internal/monitor"
 	"mirage/internal/profiler"
@@ -120,18 +121,41 @@ func (a *Analyzer) Analyze(profileData *profiler.ProfileData, systemMetrics []mo
 		}
 	}
 
-	var totalIO uint64
+	var totalRead, totalWrite uint64
 	for _, m := range profileData.ProcessMetrics {
-		totalIO += m.ReadBytes + m.WriteBytes
+		totalRead += m.ReadBytes
+		totalWrite += m.WriteBytes
 	}
+	totalIO := totalRead + totalWrite
 	if profileData.CPUProfile != nil &&
 		profileData.CPUProfile.CPUPercent < a.config.IOBoundCPUMax &&
 		totalIO >= a.config.IOBoundMinBytes {
+		evidence := "Low CPU (" + formatPercent(profileData.CPUProfile.CPUPercent) + "), high I/O (" + formatBytes(totalIO) + ")"
+		if totalRead > totalWrite && totalWrite > 0 {
+			evidence += "; dominant read (" + formatBytes(totalRead) + ")"
+		} else if totalWrite > totalRead && totalRead > 0 {
+			evidence += "; dominant write (" + formatBytes(totalWrite) + ")"
+		}
+		if profileData.CgroupStats != nil {
+			var cgRead, cgWrite uint64
+			for _, e := range profileData.CgroupStats.IOStat {
+				cgRead += e.ReadBytes
+				cgWrite += e.WriteBytes
+			}
+			evidence += "; cgroup I/O read " + formatBytes(cgRead) + ", write " + formatBytes(cgWrite)
+		}
+		if len(profileData.SyscallSummary) > 0 {
+			var names []string
+			for i := 0; i < len(profileData.SyscallSummary) && i < 5; i++ {
+				names = append(names, profileData.SyscallSummary[i].Name)
+			}
+			evidence += "; top syscalls: " + strings.Join(names, ", ")
+		}
 		findings = append(findings, Finding{
 			Resource:      ResourceIO,
 			Severity:      SeverityInfo,
 			Message:       "Process appears I/O bound",
-			Evidence:      "Low CPU (" + formatPercent(profileData.CPUProfile.CPUPercent) + "), high I/O (" + formatBytes(totalIO) + ")",
+			Evidence:      evidence,
 			Recommendation: "Consider buffered I/O or asynchronous operations.",
 		})
 	}
