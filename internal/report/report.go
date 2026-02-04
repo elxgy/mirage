@@ -1,8 +1,6 @@
 package report
 
 import (
-	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -13,26 +11,23 @@ import (
 
 	"github.com/fatih/color"
 
+	"mirage/internal/analysis"
 	"mirage/internal/monitor"
 	"mirage/internal/profiler"
 )
 
 type ReportConfig struct {
-	OutputFile   string
-	Format       ReportFormat
-	Verbose      bool
-	ShowGraphs   bool
-	ColorOutput  bool
-	IncludePprof bool
+	OutputFile  string
+	Format      ReportFormat
+	Verbose     bool
+	ColorOutput bool
 }
 
 type ReportFormat int
 
 const (
 	FormatText ReportFormat = iota
-	FormatJSON
-	FormatHTML
-	FormatCSV
+	FormatMarkdown
 )
 
 type Reporter struct {
@@ -57,22 +52,16 @@ func New(config ReportConfig) *Reporter {
 	return reporter
 }
 
-func (r *Reporter) GenerateReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) error {
+func (r *Reporter) GenerateReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics, findings []analysis.Finding, tracePath, mutexPath string) error {
 	switch r.config.Format {
-	case FormatText:
-		return r.generateTextReport(profileData, systemMetrics)
-	case FormatJSON:
-		return r.generateJSONReport(profileData, systemMetrics)
-	case FormatHTML:
-		return r.generateHTMLReport(profileData, systemMetrics)
-	case FormatCSV:
-		return r.generateCSVReport(profileData, systemMetrics)
+	case FormatMarkdown:
+		return r.generateMarkdownReport(profileData, systemMetrics, findings, tracePath, mutexPath)
 	default:
-		return r.generateTextReport(profileData, systemMetrics)
+		return r.generateTextReport(profileData, systemMetrics, findings, tracePath, mutexPath)
 	}
 }
 
-func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) error {
+func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics, findings []analysis.Finding, tracePath, mutexPath string) error {
 	var (
 		titleColor   = color.New(color.FgCyan, color.Bold)
 		successColor = color.New(color.FgGreen)
@@ -152,13 +141,22 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 		fmt.Fprintln(r.writer)
 	}
 
-	// Analysis & Recommendations
-	r.drawBox("Analysis & Recommendations", func(w io.Writer) {
-		r.writePerformanceAnalysis(w, profileData, systemMetrics)
-		fmt.Fprintln(w)
-		r.writeRecommendations(w, profileData, systemMetrics)
+	r.drawBox("Findings", func(w io.Writer) {
+		r.writeFindings(w, findings)
 	})
 	fmt.Fprintln(r.writer)
+
+	if tracePath != "" || mutexPath != "" {
+		r.drawBox("Profile Files", func(w io.Writer) {
+			if tracePath != "" {
+				r.writeKV(w, "Execution trace", tracePath+" (go tool trace)", labelColor, valueColor)
+			}
+			if mutexPath != "" {
+				r.writeKV(w, "Mutex profile", mutexPath+" (go tool pprof)", labelColor, valueColor)
+			}
+		})
+		fmt.Fprintln(r.writer)
+	}
 
 	return nil
 }
@@ -273,46 +271,30 @@ func (r *Reporter) writeSystemMetricsReport(w io.Writer, metrics []monitor.Syste
 	r.writeKV(w, "Avg Load (1m)", fmt.Sprintf("%.2f (Peak: %.2f)", avgLoad1, peakLoad1), labelColor, valueColor)
 }
 
-func (r *Reporter) writePerformanceAnalysis(w io.Writer, profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) {
-	warningColor := color.New(color.FgYellow)
+func (r *Reporter) writeFindings(w io.Writer, findings []analysis.Finding) {
 	infoColor := color.New(color.FgCyan)
+	warningColor := color.New(color.FgYellow)
+	criticalColor := color.New(color.FgRed)
+	okColor := color.New(color.FgGreen)
 
-	hasIssues := false
-
-	if profileData.CPUProfile != nil {
-		if profileData.CPUProfile.CPUPercent > 100 {
-			// Multi-core usage
-			cores := profileData.CPUProfile.CPUPercent / 100
-			warningColor.Fprintf(w, "• High CPU utilization detected (%.2f%% - using ~%.1f cores)\n", profileData.CPUProfile.CPUPercent, cores)
-			hasIssues = true
-		} else if profileData.CPUProfile.CPUPercent > 80 {
-			warningColor.Fprintf(w, "• High CPU utilization detected (%.2f%%)\n", profileData.CPUProfile.CPUPercent)
-			hasIssues = true
+	if len(findings) == 0 {
+		okColor.Fprintln(w, "• No significant performance anomalies detected.")
+		return
+	}
+	for _, f := range findings {
+		var sev *color.Color
+		switch f.Severity {
+		case analysis.SeverityCritical:
+			sev = criticalColor
+		case analysis.SeverityWarning:
+			sev = warningColor
+		default:
+			sev = infoColor
 		}
+		sev.Fprintf(w, "• [%s] %s\n", f.Severity, f.Message)
+		fmt.Fprintf(w, "  Evidence: %s\n", f.Evidence)
+		fmt.Fprintf(w, "  Recommendation: %s\n", f.Recommendation)
 	}
-
-	// Check process metrics for issues
-	for _, m := range profileData.ProcessMetrics {
-		if m.CPUPercent > 90 {
-			warningColor.Fprintf(w, "• Process hit >90%% CPU usage\n")
-			hasIssues = true
-			break
-		}
-	}
-
-	if profileData.Duration > 10*time.Second {
-		infoColor.Fprintf(w, "• Long running process (%s)\n", profileData.Duration)
-		hasIssues = true
-	}
-
-	if !hasIssues {
-		color.New(color.FgGreen).Fprintln(w, "• No significant performance anomalies detected.")
-	}
-}
-
-func (r *Reporter) writeRecommendations(w io.Writer, profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) {
-	// Simplified recommendations for the box view
-	// Logic can be expanded as needed
 }
 
 func (r *Reporter) formatBytes(bytes uint64) string {
@@ -335,209 +317,118 @@ func (r *Reporter) Close() error {
 	return nil
 }
 
-func (r *Reporter) generateJSONReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) error {
-	report := struct {
-		ProfileData   *profiler.ProfileData   `json:"profile_data"`
-		SystemMetrics []monitor.SystemMetrics `json:"system_metrics"`
-	}{
-		ProfileData:   profileData,
-		SystemMetrics: systemMetrics,
+func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics, findings []analysis.Finding, tracePath, mutexPath string) error {
+	w := r.writer
+	fmt.Fprintf(w, "# Mirage Performance Report\n\n")
+	fmt.Fprintf(w, "## Command Information\n\n")
+	fmt.Fprintf(w, "- **Command:** %s %s\n", profileData.Command, strings.Join(profileData.Args, " "))
+	fmt.Fprintf(w, "- **Start Time:** %s\n", profileData.StartTime.Format(time.RFC3339))
+	fmt.Fprintf(w, "- **End Time:** %s\n", profileData.EndTime.Format(time.RFC3339))
+	fmt.Fprintf(w, "- **Duration:** %s\n", profileData.Duration.String())
+	exitLabel := "Success"
+	if profileData.ExitCode != 0 {
+		exitLabel = "Error"
 	}
+	fmt.Fprintf(w, "- **Exit Code:** %d (%s)\n\n", profileData.ExitCode, exitLabel)
 
-	encoder := json.NewEncoder(r.writer)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(report); err != nil {
-		return fmt.Errorf("failed to encode JSON report: %v", err)
-	}
-
-	return nil
-}
-
-func (r *Reporter) generateHTMLReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) error {
-	// Simple HTML template with embedded Chart.js
-	const htmlTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Mirage Performance Report</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { font-family: sans-serif; margin: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .card { border: 1px solid #ddd; padding: 20px; margin-bottom: 20px; border-radius: 5px; }
-        h1, h2 { color: #333; }
-        table { width: 100%%; border-collapse: collapse; }
-        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background-color: #f2f2f2; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Mirage Performance Report</h1>
-        
-        <div class="card">
-            <h2>Command Information</h2>
-            <p><strong>Command:</strong> %s</p>
-            <p><strong>Duration:</strong> %s</p>
-            <p><strong>Exit Code:</strong> %d</p>
-        </div>
-
-        <div class="card">
-            <h2>Process Metrics (Target)</h2>
-            <canvas id="procCpuChart"></canvas>
-            <canvas id="procMemChart"></canvas>
-        </div>
-
-        <div class="card">
-            <h2>System Metrics (Total)</h2>
-            <canvas id="sysCpuChart"></canvas>
-            <canvas id="sysMemChart"></canvas>
-        </div>
-    </div>
-
-    <script>
-        const procMetrics = %s;
-        const sysMetrics = %s;
-        
-        const labels = procMetrics.map(m => new Date(m.Timestamp).toLocaleTimeString());
-        
-        // Process Data
-        const procCpuData = procMetrics.map(m => m.CPUPercent);
-        const procMemData = procMetrics.map(m => m.MemoryRSS / 1024 / 1024); // MB
-
-        // System Data
-        const sysCpuData = sysMetrics.map(m => {
-            return m.CPUPercent.reduce((a, b) => a + b, 0) / m.CPUPercent.length;
-        });
-        const sysMemData = sysMetrics.map(m => m.MemoryUsage.UsedPercent);
-
-        // Process CPU Chart
-        new Chart(document.getElementById('procCpuChart'), {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [{
-                    label: 'Process CPU Usage (%%)',
-                    data: procCpuData,
-                    borderColor: 'rgb(54, 162, 235)',
-                    tension: 0.1
-                }]
-            }
-        });
-
-        // Process Memory Chart
-        new Chart(document.getElementById('procMemChart'), {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [{
-                    label: 'Process RSS Memory (MB)',
-                    data: procMemData,
-                    borderColor: 'rgb(255, 159, 64)',
-                    tension: 0.1
-                }]
-            }
-        });
-
-        // System CPU Chart
-        new Chart(document.getElementById('sysCpuChart'), {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [{
-                    label: 'System Average CPU Usage (%%)',
-                    data: sysCpuData,
-                    borderColor: 'rgb(75, 192, 192)',
-                    tension: 0.1
-                }]
-            }
-        });
-
-        // System Memory Chart
-        new Chart(document.getElementById('sysMemChart'), {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [{
-                    label: 'System Memory Usage (%%)',
-                    data: sysMemData,
-                    borderColor: 'rgb(255, 99, 132)',
-                    tension: 0.1
-                }]
-            }
-        });
-    </script>
-</body>
-</html>`
-
-	procMetricsJSON, err := json.Marshal(profileData.ProcessMetrics)
-	if err != nil {
-		return fmt.Errorf("failed to marshal process metrics for HTML: %v", err)
-	}
-
-	sysMetricsJSON, err := json.Marshal(systemMetrics)
-	if err != nil {
-		return fmt.Errorf("failed to marshal system metrics for HTML: %v", err)
-	}
-
-	htmlContent := fmt.Sprintf(htmlTemplate,
-		fmt.Sprintf("%s %v", profileData.Command, profileData.Args),
-		profileData.Duration,
-		profileData.ExitCode,
-		string(procMetricsJSON),
-		string(sysMetricsJSON),
-	)
-
-	_, err = fmt.Fprint(r.writer, htmlContent)
-	return err
-}
-
-func (r *Reporter) generateCSVReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) error {
-	writer := csv.NewWriter(r.writer)
-	defer writer.Flush()
-
-	// Write header
-	header := []string{
-		"Timestamp",
-		"Process CPU %", "Process RSS", "Process VMS", "Process Read", "Process Write",
-		"System CPU %", "System Mem Used", "System Mem %", "System Load 1m",
-	}
-	if err := writer.Write(header); err != nil {
-		return fmt.Errorf("failed to write CSV header: %v", err)
-	}
-
-	// We assume process metrics and system metrics are roughly aligned in time and count
-	// If not, we iterate up to the min length
-	count := len(profileData.ProcessMetrics)
-	if len(systemMetrics) < count {
-		count = len(systemMetrics)
-	}
-
-	for i := 0; i < count; i++ {
-		pm := profileData.ProcessMetrics[i]
-		sm := systemMetrics[i]
-
-		var sysCpuTotal float64
-		for _, c := range sm.CPUPercent {
-			sysCpuTotal += c
+	if len(profileData.ProcessMetrics) > 0 {
+		var peakCPU float64
+		var peakRSS, peakVMS uint64
+		var totalRead, totalWrite uint64
+		for _, m := range profileData.ProcessMetrics {
+			if m.CPUPercent > peakCPU {
+				peakCPU = m.CPUPercent
+			}
+			if m.MemoryRSS > peakRSS {
+				peakRSS = m.MemoryRSS
+			}
+			if m.MemoryVMS > peakVMS {
+				peakVMS = m.MemoryVMS
+			}
+			totalRead += m.ReadBytes
+			totalWrite += m.WriteBytes
 		}
-		sysCpuAvg := sysCpuTotal / float64(len(sm.CPUPercent))
+		last := profileData.ProcessMetrics[len(profileData.ProcessMetrics)-1]
+		fmt.Fprintf(w, "## Process Metrics (Target + Children)\n\n")
+		fmt.Fprintf(w, "- **Peak CPU Usage:** %.2f%%\n", peakCPU)
+		fmt.Fprintf(w, "- **Peak RSS Memory:** %s\n", r.formatBytes(peakRSS))
+		fmt.Fprintf(w, "- **Peak VMS Memory:** %s\n", r.formatBytes(peakVMS))
+		fmt.Fprintf(w, "- **Total Read:** %s\n", r.formatBytes(totalRead))
+		fmt.Fprintf(w, "- **Total Write:** %s\n", r.formatBytes(totalWrite))
+		fmt.Fprintf(w, "- **Active Threads:** %d\n", last.ThreadCount)
+		fmt.Fprintf(w, "- **Open Files:** %d\n\n", last.FileDescriptors)
+	}
 
-		record := []string{
-			pm.Timestamp.Format(time.RFC3339),
-			fmt.Sprintf("%.2f", pm.CPUPercent),
-			fmt.Sprintf("%d", pm.MemoryRSS),
-			fmt.Sprintf("%d", pm.MemoryVMS),
-			fmt.Sprintf("%d", pm.ReadBytes),
-			fmt.Sprintf("%d", pm.WriteBytes),
-			fmt.Sprintf("%.2f", sysCpuAvg),
-			fmt.Sprintf("%d", sm.MemoryUsage.Used),
-			fmt.Sprintf("%.2f", sm.MemoryUsage.UsedPercent),
-			fmt.Sprintf("%.2f", sm.LoadAverage.Load1),
+	if len(systemMetrics) > 0 {
+		var avgCPU, peakCPU, avgMemPercent, peakMemPercent float64
+		var peakMemUsed uint64
+		var avgLoad1, peakLoad1 float64
+		metricsLen := len(systemMetrics)
+		sampleRate := 1
+		if metricsLen > 1000 {
+			sampleRate = metricsLen / 1000
 		}
+		sampledCount := 0
+		for i := 0; i < metricsLen; i += sampleRate {
+			m := systemMetrics[i]
+			sampledCount++
+			if len(m.CPUPercent) > 0 {
+				var totalCPU float64
+				for _, cpu := range m.CPUPercent {
+					totalCPU += cpu
+					if cpu > peakCPU {
+						peakCPU = cpu
+					}
+				}
+				avgCPU += totalCPU / float64(len(m.CPUPercent))
+			}
+			if m.MemoryUsage != nil {
+				avgMemPercent += m.MemoryUsage.UsedPercent
+				if m.MemoryUsage.UsedPercent > peakMemPercent {
+					peakMemPercent = m.MemoryUsage.UsedPercent
+				}
+				if m.MemoryUsage.Used > peakMemUsed {
+					peakMemUsed = m.MemoryUsage.Used
+				}
+			}
+			if m.LoadAverage != nil {
+				avgLoad1 += m.LoadAverage.Load1
+				if m.LoadAverage.Load1 > peakLoad1 {
+					peakLoad1 = m.LoadAverage.Load1
+				}
+			}
+		}
+		count := float64(sampledCount)
+		if count > 0 {
+			avgCPU /= count
+			avgMemPercent /= count
+			avgLoad1 /= count
+		}
+		fmt.Fprintf(w, "## System Resource Usage\n\n")
+		fmt.Fprintf(w, "- **Avg System CPU:** %.2f%% (Peak: %.2f%%)\n", avgCPU, peakCPU)
+		fmt.Fprintf(w, "- **Avg System Memory:** %.2f%% (Peak: %.2f%%)\n", avgMemPercent, peakMemPercent)
+		fmt.Fprintf(w, "- **Peak Memory Used:** %s\n", r.formatBytes(peakMemUsed))
+		fmt.Fprintf(w, "- **Avg Load (1m):** %.2f (Peak: %.2f)\n\n", avgLoad1, peakLoad1)
+	}
 
-		if err := writer.Write(record); err != nil {
-			return fmt.Errorf("failed to write CSV record: %v", err)
+	fmt.Fprintf(w, "## Findings\n\n")
+	if len(findings) == 0 {
+		fmt.Fprintf(w, "No significant performance anomalies detected.\n\n")
+	} else {
+		for _, f := range findings {
+			fmt.Fprintf(w, "- **[%s]** %s\n", f.Severity, f.Message)
+			fmt.Fprintf(w, "  - Evidence: %s\n", f.Evidence)
+			fmt.Fprintf(w, "  - Recommendation: %s\n\n", f.Recommendation)
+		}
+	}
+
+	if tracePath != "" || mutexPath != "" {
+		fmt.Fprintf(w, "## Profile Files\n\n")
+		if tracePath != "" {
+			fmt.Fprintf(w, "- **Execution trace:** %s (view with `go tool trace`)\n", tracePath)
+		}
+		if mutexPath != "" {
+			fmt.Fprintf(w, "- **Mutex profile:** %s (view with `go tool pprof`)\n", mutexPath)
 		}
 	}
 

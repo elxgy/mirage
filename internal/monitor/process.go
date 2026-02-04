@@ -29,6 +29,7 @@ type ProcessMonitor struct {
 	lastRead     uint64
 	lastWrite    uint64
 	hasBaselines bool
+	OnSample     func(ProcessMetrics)
 }
 
 func NewProcessMonitor(pid int32, interval time.Duration) *ProcessMonitor {
@@ -64,6 +65,9 @@ func (pm *ProcessMonitor) Start(ctx context.Context) error {
 				pm.mutex.Lock()
 				pm.metrics = append(pm.metrics, *metrics)
 				pm.mutex.Unlock()
+				if pm.OnSample != nil {
+					pm.OnSample(*metrics)
+				}
 			}
 		}
 	}

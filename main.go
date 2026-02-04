@@ -11,9 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"mirage/internal/analysis"
 	"mirage/internal/monitor"
+	"mirage/internal/pipeline"
 	"mirage/internal/profiler"
 	"mirage/internal/report"
+	"mirage/internal/ui/tui"
 )
 
 var (
@@ -22,11 +25,13 @@ var (
 	profileDir  = flag.String("profile-dir", "", "Directory to store profile files (default: temp dir)")
 	enableCPU   = flag.Bool("cpu", true, "Enable CPU profiling")
 	enableMem   = flag.Bool("mem", true, "Enable memory profiling")
+	enableTrace = flag.Bool("trace", false, "Enable execution trace (go tool trace)")
+	enableMutex = flag.Bool("mutex", false, "Enable mutex profile (go tool pprof)")
 	monitorFreq = flag.Duration("freq", 100*time.Millisecond, "System monitoring frequency")
 	timeout     = flag.Duration("timeout", 0, "Maximum execution time (0 = no timeout)")
 	noColor     = flag.Bool("no-color", false, "Disable colored output")
-	format      = flag.String("format", "text", "Report format (text, json, html, csv)")
-	showGraphs  = flag.Bool("graphs", false, "Include performance graphs in report")
+	format  = flag.String("format", "text", "Report format (text or markdown)")
+	ui      = flag.Bool("ui", false, "Show live TUI dashboard while profiling")
 	help        = flag.Bool("h", false, "Show help message")
 )
 
@@ -82,12 +87,111 @@ func main() {
 		cancel()
 	}()
 
-	if err := runBenchmark(ctx, args[0], args[1:]...); err != nil {
-		if err == context.DeadlineExceeded {
-			log.Fatalf("Benchmark timed out after %v", *timeout)
+	if *ui {
+		if err := runTUI(ctx, args[0], args[1:]...); err != nil {
+			if err == context.DeadlineExceeded {
+				log.Fatalf("Benchmark timed out after %v", *timeout)
+			}
+			log.Fatalf("TUI run failed: %v", err)
 		}
-		log.Fatalf("Benchmark failed: %v", err)
+	} else {
+		if err := runBenchmark(ctx, args[0], args[1:]...); err != nil {
+			if err == context.DeadlineExceeded {
+				log.Fatalf("Benchmark timed out after %v", *timeout)
+			}
+			log.Fatalf("Benchmark failed: %v", err)
+		}
 	}
+}
+
+func runTUI(ctx context.Context, command string, args ...string) error {
+	metricsChan := make(chan monitor.ProcessMetrics, 64)
+	doneChan := make(chan tui.ProfileDoneMsg, 1)
+	resultChan := make(chan tui.ProfileDoneMsg, 1)
+
+	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *profileDir, *monitorFreq)
+	prof.SetMetricsCallback(func(m monitor.ProcessMetrics) {
+		select {
+		case metricsChan <- m:
+		default:
+		}
+	})
+
+	mon := monitor.NewSystemMonitor(*monitorFreq)
+	monitorCtx, monitorCancel := context.WithCancel(ctx)
+	monitorDone := make(chan error, 1)
+	go func() {
+		monitorDone <- mon.Start(monitorCtx)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	go func() {
+		profileData, err := prof.Profile(ctx, command, args...)
+		msg := tui.ProfileDoneMsg{Data: profileData, Err: err}
+		select {
+		case doneChan <- msg:
+		default:
+		}
+		select {
+		case resultChan <- msg:
+		default:
+		}
+	}()
+
+	getSystem := func() *monitor.SystemMetrics {
+		return mon.GetLatestMetrics()
+	}
+
+	prog := tui.NewProgram(command, args, metricsChan, getSystem, doneChan)
+	if _, err := prog.Run(); err != nil {
+		monitorCancel()
+		mon.Stop()
+		return err
+	}
+
+	var result tui.ProfileDoneMsg
+	select {
+	case result = <-resultChan:
+	case <-time.After(2 * time.Second):
+		monitorCancel()
+		mon.Stop()
+		return fmt.Errorf("profile result not received")
+	}
+
+	monitorCancel()
+	mon.Stop()
+	select {
+	case <-monitorDone:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if result.Err != nil {
+		return result.Err
+	}
+
+	systemMetrics := mon.GetMetrics()
+	session := pipeline.NewSession(command, args)
+	session.ProfileData = result.Data
+	session.SystemMetrics = systemMetrics
+	session.EndTime = result.Data.EndTime
+	session.TracePath = result.Data.TracePath
+	session.MutexPath = result.Data.MutexPath
+
+	pipeline.Normalize(session)
+	pipeline.Analyze(session, analysis.DefaultConfig)
+
+	fmt.Print("\n\n")
+	if err := generateReport(session); err != nil {
+		return err
+	}
+
+	if *verbose && (*enableCPU || *enableMem) {
+		fmt.Printf("\nTo analyze profiles: go tool pprof %s/cpu.prof\n", *profileDir)
+		fmt.Printf("  go tool pprof -http=:8080 %s/cpu.prof\n", *profileDir)
+	}
+
+	return nil
 }
 
 func runBenchmark(ctx context.Context, command string, args ...string) error {
@@ -97,7 +201,7 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 		fmt.Printf("Monitoring frequency: %s\n", *monitorFreq)
 	}
 
-	prof := profiler.New(*enableCPU, *enableMem, *profileDir, *monitorFreq)
+	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *profileDir, *monitorFreq)
 	mon := monitor.NewSystemMonitor(*monitorFreq)
 
 	monitorCtx, monitorCancel := context.WithCancel(ctx)
@@ -135,15 +239,25 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 
 	systemMetrics := mon.GetMetrics()
 
+	session := pipeline.NewSession(command, args)
+	session.ProfileData = profileData
+	session.SystemMetrics = systemMetrics
+	session.EndTime = profileData.EndTime
+	session.TracePath = profileData.TracePath
+	session.MutexPath = profileData.MutexPath
+
+	pipeline.Normalize(session)
+	pipeline.Analyze(session, analysis.DefaultConfig)
+
 	if *verbose {
 		fmt.Printf("Profiling completed. Collected %d system metrics samples.\n", len(systemMetrics))
 		fmt.Printf("Command executed in: %s\n", profileData.Duration)
 		fmt.Printf("Exit code: %d\n", profileData.ExitCode)
 	}
 
-	fmt.Print("\n\n") // Separate process output from report
+	fmt.Print("\n\n")
 
-	if err := generateReport(profileData, systemMetrics); err != nil {
+	if err := generateReport(session); err != nil {
 		return fmt.Errorf("failed to generate report: %v", err)
 	}
 
@@ -165,34 +279,28 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 	return nil
 }
 
-func generateReport(profileData *profiler.ProfileData, systemMetrics []monitor.SystemMetrics) error {
+func generateReport(session *pipeline.Session) error {
 	var reportFormat report.ReportFormat
 	switch *format {
 	case "text":
 		reportFormat = report.FormatText
-	case "json":
-		reportFormat = report.FormatJSON
-	case "html":
-		reportFormat = report.FormatHTML
-	case "csv":
-		reportFormat = report.FormatCSV
+	case "markdown":
+		reportFormat = report.FormatMarkdown
 	default:
-		return fmt.Errorf("unsupported report format: %s", *format)
+		return fmt.Errorf("unsupported report format: %s (use text or markdown)", *format)
 	}
 
 	config := report.ReportConfig{
-		OutputFile:   *outputFile,
-		Format:       reportFormat,
-		Verbose:      *verbose,
-		ShowGraphs:   *showGraphs,
-		ColorOutput:  !*noColor,
-		IncludePprof: *enableCPU || *enableMem,
+		OutputFile:  *outputFile,
+		Format:      reportFormat,
+		Verbose:     *verbose,
+		ColorOutput: !*noColor,
 	}
 
 	reporter := report.New(config)
 	defer reporter.Close()
 
-	if err := reporter.GenerateReport(profileData, systemMetrics); err != nil {
+	if err := reporter.GenerateReport(session.ProfileData, session.SystemMetrics, session.Findings, session.TracePath, session.MutexPath); err != nil {
 		return fmt.Errorf("failed to generate report: %v", err)
 	}
 
@@ -224,7 +332,8 @@ func showUsage() {
 	fmt.Printf("  %s -o report.txt python script.py  # Profile Python script, save to file\n", appName)
 	fmt.Printf("  %s -v --cpu --mem ./myapp          # Verbose profiling with CPU and memory\n", appName)
 	fmt.Printf("  %s -timeout 30s long-running-app   # Profile with 30 second timeout\n", appName)
-	fmt.Printf("  %s -format json -o data.json app   # Generate JSON report\n", appName)
+	fmt.Printf("  %s -format markdown -o report.md app  # Markdown report\n", appName)
+	fmt.Printf("  %s -ui ./myapp                        # Live TUI dashboard while profiling\n", appName)
 	fmt.Printf("\n")
 
 	fmt.Printf("OPTIONS:\n")
@@ -247,10 +356,8 @@ func showUsage() {
 	})
 
 	fmt.Printf("\nREPORT FORMATS:\n")
-	fmt.Printf("  text     Human-readable text report with tables and analysis\n")
-	fmt.Printf("  json     Machine-readable JSON format\n")
-	fmt.Printf("  html     Interactive HTML report with charts (future)\n")
-	fmt.Printf("  csv      Comma-separated values for spreadsheet import (future)\n")
+	fmt.Printf("  text     Terminal report with colored output (default)\n")
+	fmt.Printf("  markdown Markdown report for files or documentation\n")
 
 	fmt.Printf("\nPROFILING FEATURES:\n")
 	fmt.Printf("  CPU time measurement (user/system time split)\n")

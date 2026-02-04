@@ -8,10 +8,9 @@ import (
 	"os/exec"
 	"runtime"
 	"runtime/pprof"
+	"runtime/trace"
 	"syscall"
 	"time"
-
-	"github.com/shirou/gopsutil/v3/process"
 )
 
 type ProfileData struct {
@@ -25,8 +24,9 @@ type ProfileData struct {
 	MemProfile     *MemoryProfileData
 	ProcessStats   *ProcessStats
 	SystemStats    *SystemStats
-	StackTraces    []string
 	ProcessMetrics []monitor.ProcessMetrics
+	TracePath      string
+	MutexPath      string
 }
 
 type CPUProfileData struct {
@@ -46,34 +46,38 @@ type MemoryProfileData struct {
 }
 
 type ProcessStats struct {
-	PID             int32
-	PPID            int32
-	NumThreads      int32
-	NumFDs          int32
-	ContextSwitches *process.NumCtxSwitchesStat
+	PID        int32
+	NumThreads int32
+	NumFDs     int32
 }
 
 type SystemStats struct {
-	CPUCount    int
-	LoadAvg     []float64
-	MemoryTotal uint64
-	MemoryFree  uint64
+	CPUCount int
 }
 
 type Profiler struct {
 	enableCPUProfile bool
 	enableMemProfile bool
+	enableTrace      bool
+	enableMutex      bool
 	profileDir       string
 	monitorInterval  time.Duration
+	metricsCallback  func(monitor.ProcessMetrics)
 }
 
-func New(enableCPU, enableMem bool, profileDir string, monitorInterval time.Duration) *Profiler {
+func NewWithTraceMutex(enableCPU, enableMem, enableTrace, enableMutex bool, profileDir string, monitorInterval time.Duration) *Profiler {
 	return &Profiler{
 		enableCPUProfile: enableCPU,
 		enableMemProfile: enableMem,
-		profileDir:       profileDir,
-		monitorInterval:  monitorInterval,
+		enableTrace:       enableTrace,
+		enableMutex:      enableMutex,
+		profileDir:        profileDir,
+		monitorInterval:   monitorInterval,
 	}
+}
+
+func (p *Profiler) SetMetricsCallback(f func(monitor.ProcessMetrics)) {
+	p.metricsCallback = f
 }
 
 func (p *Profiler) Profile(ctx context.Context, command string, args ...string) (*ProfileData, error) {
@@ -102,6 +106,20 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 		defer pprof.StopCPUProfile()
 	}
 
+	if p.enableTrace {
+		tracePath := fmt.Sprintf("%s/trace.out", p.profileDir)
+		traceFile, err := os.Create(tracePath)
+		if err != nil {
+			return data, fmt.Errorf("failed to create trace file: %v", err)
+		}
+		defer traceFile.Close()
+		if err := trace.Start(traceFile); err != nil {
+			return data, fmt.Errorf("failed to start trace: %v", err)
+		}
+		defer trace.Stop()
+		data.TracePath = tracePath
+	}
+
 	data.SystemStats = p.getSystemStats()
 
 	if err := cmd.Start(); err != nil {
@@ -110,8 +128,10 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 		return data, fmt.Errorf("failed to start command: %v", err)
 	}
 
-	// Start Process Monitor
 	procMon := monitor.NewProcessMonitor(int32(cmd.Process.Pid), p.monitorInterval)
+	if p.metricsCallback != nil {
+		procMon.OnSample = p.metricsCallback
+	}
 	procMonCtx, procMonCancel := context.WithCancel(ctx)
 
 	monitorDone := make(chan error, 1)
@@ -173,6 +193,21 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 			runtime.SetBlockProfileRate(1)
 			pprof.Lookup("block").WriteTo(blockProfile, 0)
 		}
+	}
+
+	if p.enableMutex {
+		mutexPath := fmt.Sprintf("%s/mutex.prof", p.profileDir)
+		runtime.SetMutexProfileFraction(1)
+		defer runtime.SetMutexProfileFraction(0)
+		mutexFile, err := os.Create(mutexPath)
+		if err != nil {
+			return data, fmt.Errorf("failed to create mutex profile: %v", err)
+		}
+		defer mutexFile.Close()
+		if err := pprof.Lookup("mutex").WriteTo(mutexFile, 0); err != nil {
+			return data, fmt.Errorf("failed to write mutex profile: %v", err)
+		}
+		data.MutexPath = mutexPath
 	}
 
 	return data, nil
