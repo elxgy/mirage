@@ -38,16 +38,34 @@ clean:
 run: build
 	@./$(BUILD_DIR)/$(BINARY_NAME) -v ls -la
 
+.PHONY: run-standard
+run-standard: build
+	@./$(BUILD_DIR)/$(BINARY_NAME) --standard -v ls -la
+
+.PHONY: run-deep
+run-deep: build
+	@./$(BUILD_DIR)/$(BINARY_NAME) --deep -v ls -la
+
+.PHONY: preload
+preload:
+	@$(MAKE) -C internal/instrument/preload
+	@mkdir -p $(BUILD_DIR)
+	@cp internal/instrument/preload/preload_shim.so $(BUILD_DIR)/
+	@echo "Preload shim built and copied to $(BUILD_DIR)/preload_shim.so"
+
 .PHONY: help
 help:
 	@echo "Mirage v$(VERSION)"
 	@echo ""
 	@echo "Available targets:"
-	@echo "  build    - Build the binary"
-	@echo "  install  - Install to GOPATH/bin"
-	@echo "  test     - Run tests"
-	@echo "  fmt      - Format code"
-	@echo "  vet      - Run go vet"
-	@echo "  clean    - Remove build artifacts"
-	@echo "  run      - Build and run example"
-	@echo "  help     - Show this help"
+	@echo "  build        - Build the binary"
+	@echo "  install      - Install to GOPATH/bin"
+	@echo "  test         - Run tests"
+	@echo "  fmt          - Format code"
+	@echo "  vet          - Run go vet"
+	@echo "  clean        - Remove build artifacts"
+	@echo "  run          - Build and run example"
+	@echo "  run-standard - Build and run with --standard mode"
+	@echo "  run-deep     - Build and run with --deep mode"
+	@echo "  preload      - Build LD_PRELOAD shim and copy to build dir"
+	@echo "  help         - Show this help"

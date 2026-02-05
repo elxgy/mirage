@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,9 +36,17 @@ var (
 	ui          = flag.Bool("ui", false, "Show live TUI dashboard while profiling")
 	enableCgroup  = flag.Bool("cgroup", false, "Run target in cgroup v2 scope (Linux); report cgroup I/O and memory")
 	enableStrace  = flag.Bool("strace", false, "Trace syscalls (strace -f -c); report syscall summary (Linux)")
-	enableSample  = flag.Bool("sample", false, "Sample /proc syscall at high frequency; report top syscalls (Linux)")
-	pprofPath     = flag.String("pprof", "", "Parse target-generated pprof file and report top functions (e.g. path to cpu.prof)")
-	help          = flag.Bool("h", false, "Show help message")
+	enableSample   = flag.Bool("sample", false, "Sample /proc syscall at high frequency; report top syscalls (Linux)")
+	enablePreload   = flag.Bool("preload", false, "Run target with LD_PRELOAD shim; report interposed call counts (dynamic link only)")
+	preloadShimPath = flag.String("preload-so", "", "Path to preload shim .so (default: preload_shim.so next to mirage binary)")
+	instrumentGo     = flag.Bool("instrument-go", false, "Set MIRAGE_INSTRUMENT=1 for Go binaries built with -toolexec; see docs/INSTRUMENTATION.md")
+	uprobeSymbols   = flag.String("uprobe-symbols", "", "Comma-separated symbols for eBPF uprobes (Linux, requires CAP_SYS_ADMIN)")
+	uprobeBinary    = flag.String("uprobe-binary", "", "Binary path for uprobes (default: target command)")
+	pprofPath       = flag.String("pprof", "", "Parse target-generated pprof file and report top functions (e.g. path to cpu.prof)")
+	mode            = flag.String("mode", "", "Profiling mode: basic, standard, or deep (enables preset options)")
+	deepMode        = flag.Bool("deep", false, "Same as --mode=deep")
+	standardMode    = flag.Bool("standard", false, "Same as --mode=standard")
+	help            = flag.Bool("h", false, "Show help message")
 )
 
 const (
@@ -60,6 +69,14 @@ func main() {
 		showUsage()
 		os.Exit(1)
 	}
+
+	resolvedMode := *mode
+	if *deepMode {
+		resolvedMode = "deep"
+	} else if *standardMode {
+		resolvedMode = "standard"
+	}
+	applyModePreset(resolvedMode)
 
 	if *profileDir == "" {
 		tempDir, err := os.MkdirTemp("", "mirage-profile-*")
@@ -114,7 +131,8 @@ func runTUI(ctx context.Context, command string, args ...string) error {
 	doneChan := make(chan tui.ProfileDoneMsg, 1)
 	resultChan := make(chan tui.ProfileDoneMsg, 1)
 
-	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *enableCgroup, *enableStrace, *enableSample, *profileDir, *monitorFreq)
+	uprobeList := parseUprobeSymbols(*uprobeSymbols)
+	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *enableCgroup, *enableStrace, *enableSample, *enablePreload, *preloadShimPath, *instrumentGo, uprobeList, *uprobeBinary, *profileDir, *monitorFreq)
 	prof.SetMetricsCallback(func(m monitor.ProcessMetrics) {
 		select {
 		case metricsChan <- m:
@@ -207,7 +225,8 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 		fmt.Printf("Monitoring frequency: %s\n", *monitorFreq)
 	}
 
-	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *enableCgroup, *enableStrace, *enableSample, *profileDir, *monitorFreq)
+	uprobeList := parseUprobeSymbols(*uprobeSymbols)
+	prof := profiler.NewWithTraceMutex(*enableCPU, *enableMem, *enableTrace, *enableMutex, *enableCgroup, *enableStrace, *enableSample, *enablePreload, *preloadShimPath, *instrumentGo, uprobeList, *uprobeBinary, *profileDir, *monitorFreq)
 	mon := monitor.NewSystemMonitor(*monitorFreq)
 
 	monitorCtx, monitorCancel := context.WithCancel(ctx)
@@ -286,6 +305,32 @@ func runBenchmark(ctx context.Context, command string, args ...string) error {
 	return nil
 }
 
+func applyModePreset(mode string) {
+	switch mode {
+	case "standard":
+		*enableCgroup = true
+	case "deep":
+		*enableCgroup = true
+		*enableSample = true
+		*enablePreload = true
+		*instrumentGo = true
+	}
+}
+
+func parseUprobeSymbols(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func attachPprofSummary(data *profiler.ProfileData, path string) {
 	if data == nil || path == "" {
 		return
@@ -341,7 +386,8 @@ func showUsage() {
 	fmt.Printf("%s v%s - Advanced Application Profiling and Benchmarking Tool\n\n", appName, appVersion)
 
 	fmt.Printf("USAGE:\n")
-	fmt.Printf("  %s [OPTIONS] <command> [args...]\n\n", appName)
+	fmt.Printf("  %s [OPTIONS] <command> [args...]\n", appName)
+	fmt.Printf("  Use --mode=basic|standard|deep or --deep / --standard to enable presets.\n\n")
 
 	fmt.Printf("DESCRIPTION:\n")
 	fmt.Printf("  Mirage profiles and benchmarks applications, providing detailed performance\n")

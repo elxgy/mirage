@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -100,7 +101,7 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 	// Process Metrics
 	if len(profileData.ProcessMetrics) > 0 {
 		r.drawBox("Process Metrics (Target + Children)", func(w io.Writer) {
-			var peakCPU float64
+			var peakCPUSampled float64
 			var totalRead, totalWrite uint64
 			peakRSS := uint64(0)
 			peakVMS := uint64(0)
@@ -109,8 +110,8 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 				peakVMS = profileData.MemProfile.PeakVMS
 			}
 			for _, m := range profileData.ProcessMetrics {
-				if m.CPUPercent > peakCPU {
-					peakCPU = m.CPUPercent
+				if m.CPUPercent > peakCPUSampled {
+					peakCPUSampled = m.CPUPercent
 				}
 				if m.MemoryRSS > peakRSS {
 					peakRSS = m.MemoryRSS
@@ -122,11 +123,34 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 				totalWrite += m.WriteBytes
 			}
 
+			durationSec := profileData.Duration.Seconds()
+			var cpuLabel, cpuVal string
+			if profileData.CgroupStats != nil && profileData.CgroupStats.CPUStat.UsageUsec > 0 {
+				cpuSec := float64(profileData.CgroupStats.CPUStat.UsageUsec) / 1e6
+				cpuPct := 0.0
+				if durationSec > 0 {
+					cpuPct = cpuSec / durationSec * 100
+				}
+				cpuLabel = "CPU (isolated)"
+				cpuVal = fmt.Sprintf("%.2fs (%.2f%%)", cpuSec, cpuPct)
+			} else if profileData.CPUProfile != nil && profileData.Duration > 0 {
+				cpuLabel = "CPU (isolated)"
+				cpuVal = fmt.Sprintf("%.2fs (%.2f%%)", profileData.CPUProfile.TotalTime.Seconds(), profileData.CPUProfile.CPUPercent)
+			} else {
+				cpuLabel = "Peak CPU Usage"
+				cpuVal = fmt.Sprintf("%.2f%%", peakCPUSampled)
+			}
+
 			last := profileData.ProcessMetrics[len(profileData.ProcessMetrics)-1]
 
-			r.writeKV(w, "Peak CPU Usage", fmt.Sprintf("%.2f%%", peakCPU), labelColor, valueColor)
-			r.writeKV(w, "Peak RSS Memory", r.formatBytes(peakRSS), labelColor, valueColor)
-			r.writeKV(w, "Peak VMS Memory", r.formatBytes(peakVMS), labelColor, valueColor)
+			r.writeKV(w, cpuLabel, cpuVal, labelColor, valueColor)
+			if profileData.CgroupStats != nil {
+				r.writeKV(w, "Memory (isolated)", r.formatBytes(profileData.CgroupStats.MemoryCurrent), labelColor, valueColor)
+				r.writeKV(w, "Peak RSS", r.formatBytes(peakRSS), labelColor, valueColor)
+			} else {
+				r.writeKV(w, "Peak RSS Memory", r.formatBytes(peakRSS), labelColor, valueColor)
+				r.writeKV(w, "Peak VMS Memory", r.formatBytes(peakVMS), labelColor, valueColor)
+			}
 			r.writeKV(w, "Total Read", r.formatBytes(totalRead), labelColor, valueColor)
 			r.writeKV(w, "Total Write", r.formatBytes(totalWrite), labelColor, valueColor)
 			r.writeKV(w, "Active Threads", fmt.Sprintf("%d", last.ThreadCount), labelColor, valueColor)
@@ -137,6 +161,14 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 
 	if profileData.CgroupStats != nil {
 		r.drawBox("Cgroup (v2)", func(w io.Writer) {
+			if profileData.CgroupStats.CPUStat.UsageUsec > 0 {
+				cpuSec := float64(profileData.CgroupStats.CPUStat.UsageUsec) / 1e6
+				cpuPct := 0.0
+				if profileData.Duration > 0 {
+					cpuPct = cpuSec / profileData.Duration.Seconds() * 100
+				}
+				r.writeKV(w, "CPU time", fmt.Sprintf("%.2fs (%.2f%%)", cpuSec, cpuPct), labelColor, valueColor)
+			}
 			r.writeKV(w, "Memory (current)", r.formatBytes(profileData.CgroupStats.MemoryCurrent), labelColor, valueColor)
 			var totalRead, totalWrite uint64
 			for _, e := range profileData.CgroupStats.IOStat {
@@ -203,6 +235,34 @@ func (r *Reporter) generateTextReport(profileData *profiler.ProfileData, systemM
 			r.writeKV(w, "File", profileData.TargetPprofPath, labelColor, valueColor)
 			for _, e := range profileData.TargetPprofTop {
 				fmt.Fprintf(w, "%-50s %10d\n", e.Name, e.Value)
+			}
+		})
+		fmt.Fprintln(r.writer)
+	}
+
+	if len(profileData.PreloadStats) > 0 {
+		r.drawBox("Preload hooks (LD_PRELOAD)", func(w io.Writer) {
+			names := make([]string, 0, len(profileData.PreloadStats))
+			for k := range profileData.PreloadStats {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				fmt.Fprintf(w, "%-20s %10d\n", name, profileData.PreloadStats[name])
+			}
+		})
+		fmt.Fprintln(r.writer)
+	}
+
+	if len(profileData.UprobeCounts) > 0 {
+		r.drawBox("Uprobe hits", func(w io.Writer) {
+			names := make([]string, 0, len(profileData.UprobeCounts))
+			for k := range profileData.UprobeCounts {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				fmt.Fprintf(w, "%-30s %10d\n", name, profileData.UprobeCounts[name])
 			}
 		})
 		fmt.Fprintln(r.writer)
@@ -382,7 +442,7 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 	fmt.Fprintf(w, "- **Exit Code:** %d (%s)\n\n", profileData.ExitCode, exitLabel)
 
 	if len(profileData.ProcessMetrics) > 0 {
-		var peakCPU float64
+		var peakCPUSampled float64
 		var totalRead, totalWrite uint64
 		peakRSS := uint64(0)
 		peakVMS := uint64(0)
@@ -391,8 +451,8 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 			peakVMS = profileData.MemProfile.PeakVMS
 		}
 		for _, m := range profileData.ProcessMetrics {
-			if m.CPUPercent > peakCPU {
-				peakCPU = m.CPUPercent
+			if m.CPUPercent > peakCPUSampled {
+				peakCPUSampled = m.CPUPercent
 			}
 			if m.MemoryRSS > peakRSS {
 				peakRSS = m.MemoryRSS
@@ -403,11 +463,33 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 			totalRead += m.ReadBytes
 			totalWrite += m.WriteBytes
 		}
+		durationSec := profileData.Duration.Seconds()
+		var cpuLabel, cpuVal string
+		if profileData.CgroupStats != nil && profileData.CgroupStats.CPUStat.UsageUsec > 0 {
+			cpuSec := float64(profileData.CgroupStats.CPUStat.UsageUsec) / 1e6
+			cpuPct := 0.0
+			if durationSec > 0 {
+				cpuPct = cpuSec / durationSec * 100
+			}
+			cpuLabel = "CPU (isolated)"
+			cpuVal = fmt.Sprintf("%.2fs (%.2f%%)", cpuSec, cpuPct)
+		} else if profileData.CPUProfile != nil && profileData.Duration > 0 {
+			cpuLabel = "CPU (isolated)"
+			cpuVal = fmt.Sprintf("%.2fs (%.2f%%)", profileData.CPUProfile.TotalTime.Seconds(), profileData.CPUProfile.CPUPercent)
+		} else {
+			cpuLabel = "Peak CPU Usage"
+			cpuVal = fmt.Sprintf("%.2f%%", peakCPUSampled)
+		}
 		last := profileData.ProcessMetrics[len(profileData.ProcessMetrics)-1]
 		fmt.Fprintf(w, "## Process Metrics (Target + Children)\n\n")
-		fmt.Fprintf(w, "- **Peak CPU Usage:** %.2f%%\n", peakCPU)
-		fmt.Fprintf(w, "- **Peak RSS Memory:** %s\n", r.formatBytes(peakRSS))
-		fmt.Fprintf(w, "- **Peak VMS Memory:** %s\n", r.formatBytes(peakVMS))
+		fmt.Fprintf(w, "- **%s:** %s\n", cpuLabel, cpuVal)
+		if profileData.CgroupStats != nil {
+			fmt.Fprintf(w, "- **Memory (isolated):** %s\n", r.formatBytes(profileData.CgroupStats.MemoryCurrent))
+			fmt.Fprintf(w, "- **Peak RSS:** %s\n", r.formatBytes(peakRSS))
+		} else {
+			fmt.Fprintf(w, "- **Peak RSS Memory:** %s\n", r.formatBytes(peakRSS))
+			fmt.Fprintf(w, "- **Peak VMS Memory:** %s\n", r.formatBytes(peakVMS))
+		}
 		fmt.Fprintf(w, "- **Total Read:** %s\n", r.formatBytes(totalRead))
 		fmt.Fprintf(w, "- **Total Write:** %s\n", r.formatBytes(totalWrite))
 		fmt.Fprintf(w, "- **Active Threads:** %d\n", last.ThreadCount)
@@ -421,6 +503,14 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 			totalWrite += e.WriteBytes
 		}
 		fmt.Fprintf(w, "## Cgroup (v2)\n\n")
+		if profileData.CgroupStats.CPUStat.UsageUsec > 0 {
+			cpuSec := float64(profileData.CgroupStats.CPUStat.UsageUsec) / 1e6
+			cpuPct := 0.0
+			if profileData.Duration > 0 {
+				cpuPct = cpuSec / profileData.Duration.Seconds() * 100
+			}
+			fmt.Fprintf(w, "- **CPU time:** %.2fs (%.2f%%)\n", cpuSec, cpuPct)
+		}
 		fmt.Fprintf(w, "- **Memory (current):** %s\n", r.formatBytes(profileData.CgroupStats.MemoryCurrent))
 		fmt.Fprintf(w, "- **I/O read:** %s\n", r.formatBytes(totalRead))
 		fmt.Fprintf(w, "- **I/O write:** %s\n\n", r.formatBytes(totalWrite))
@@ -531,6 +621,34 @@ func (r *Reporter) generateMarkdownReport(profileData *profiler.ProfileData, sys
 		fmt.Fprintf(w, "| Function | Value |\n|----------|-------|\n")
 		for _, e := range profileData.TargetPprofTop {
 			fmt.Fprintf(w, "| %s | %d |\n", e.Name, e.Value)
+		}
+		fmt.Fprintf(w, "\n")
+	}
+
+	if len(profileData.PreloadStats) > 0 {
+		fmt.Fprintf(w, "## Preload hooks (LD_PRELOAD)\n\n")
+		fmt.Fprintf(w, "| Symbol | Count |\n|--------|-------|\n")
+		names := make([]string, 0, len(profileData.PreloadStats))
+		for k := range profileData.PreloadStats {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(w, "| %s | %d |\n", name, profileData.PreloadStats[name])
+		}
+		fmt.Fprintf(w, "\n")
+	}
+
+	if len(profileData.UprobeCounts) > 0 {
+		fmt.Fprintf(w, "## Uprobe hits\n\n")
+		fmt.Fprintf(w, "| Symbol | Hits |\n|--------|------|\n")
+		names := make([]string, 0, len(profileData.UprobeCounts))
+		for k := range profileData.UprobeCounts {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(w, "| %s | %d |\n", name, profileData.UprobeCounts[name])
 		}
 		fmt.Fprintf(w, "\n")
 	}

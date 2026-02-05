@@ -103,11 +103,16 @@ var syscallNames = map[int]string{
 	322: "pwritev2",
 }
 
+const maxThreadsPerTick = 128
+
 func (s *Sampler) collect() {
 	procDir := filepath.Join("/proc", strconv.Itoa(s.rootPID), "task")
 	entries, err := os.ReadDir(procDir)
 	if err != nil {
 		return
+	}
+	if len(entries) > maxThreadsPerTick {
+		entries = entries[:maxThreadsPerTick]
 	}
 	now := time.Now()
 	for _, e := range entries {

@@ -50,6 +50,16 @@ func (pm *ProcessMonitor) Start(ctx context.Context) error {
 	pm.isRunning = true
 	pm.mutex.Unlock()
 
+	metrics := pm.collectMetrics()
+	if metrics != nil {
+		pm.mutex.Lock()
+		pm.metrics = append(pm.metrics, *metrics)
+		pm.mutex.Unlock()
+		if pm.OnSample != nil {
+			pm.OnSample(*metrics)
+		}
+	}
+
 	ticker := time.NewTicker(pm.interval)
 	defer ticker.Stop()
 

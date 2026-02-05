@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"mirage/internal/cgroup"
+	"mirage/internal/instrument/preload"
+	"mirage/internal/instrument/uprobe"
 	"mirage/internal/monitor"
 	"mirage/internal/sampler"
 	"mirage/internal/syscalltrace"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -35,6 +39,8 @@ type ProfileData struct {
 	TopSyscallsSampled []sampler.SyscallCount
 	TargetPprofPath    string
 	TargetPprofTop     []PprofTopEntry
+	PreloadStats       map[string]int64
+	UprobeCounts       map[string]uint64
 }
 
 type PprofTopEntry struct {
@@ -76,22 +82,32 @@ type Profiler struct {
 	enableCgroup     bool
 	enableStrace     bool
 	enableSample     bool
-	profileDir       string
+	enablePreload     bool
+	preloadShimPath   string
+	enableInstrumentGo bool
+	uprobeSymbols      []string
+	uprobeBinary       string
+	profileDir         string
 	monitorInterval  time.Duration
 	metricsCallback  func(monitor.ProcessMetrics)
 }
 
-func NewWithTraceMutex(enableCPU, enableMem, enableTrace, enableMutex, enableCgroup, enableStrace, enableSample bool, profileDir string, monitorInterval time.Duration) *Profiler {
+func NewWithTraceMutex(enableCPU, enableMem, enableTrace, enableMutex, enableCgroup, enableStrace, enableSample, enablePreload bool, preloadShimPath string, enableInstrumentGo bool, uprobeSymbols []string, uprobeBinary, profileDir string, monitorInterval time.Duration) *Profiler {
 	return &Profiler{
-		enableCPUProfile: enableCPU,
-		enableMemProfile: enableMem,
-		enableTrace:      enableTrace,
-		enableMutex:      enableMutex,
-		enableCgroup:     enableCgroup,
-		enableStrace:     enableStrace,
-		enableSample:     enableSample,
-		profileDir:       profileDir,
-		monitorInterval:  monitorInterval,
+		enableCPUProfile:   enableCPU,
+		enableMemProfile:   enableMem,
+		enableTrace:        enableTrace,
+		enableMutex:        enableMutex,
+		enableCgroup:       enableCgroup,
+		enableStrace:       enableStrace,
+		enableSample:       enableSample,
+		enablePreload:      enablePreload,
+		preloadShimPath:    preloadShimPath,
+		enableInstrumentGo: enableInstrumentGo,
+		uprobeSymbols:     uprobeSymbols,
+		uprobeBinary:      uprobeBinary,
+		profileDir:        profileDir,
+		monitorInterval:   monitorInterval,
 	}
 }
 
@@ -109,6 +125,25 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	if p.enablePreload {
+		preloadOutPath := filepath.Join(p.profileDir, "preload_out.txt")
+		env, err := preload.Env(p.preloadShimPath, preloadOutPath)
+		if err != nil {
+			return data, fmt.Errorf("preload: %w", err)
+		}
+		if env == nil {
+			fmt.Fprintf(os.Stderr, "mirage: preload skipped: shim not found (run 'make preload' or set --preload-so)\n")
+		} else {
+			cmd.Env = append(os.Environ(), env...)
+		}
+	}
+	if p.enableInstrumentGo {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, "MIRAGE_INSTRUMENT=1")
+	}
 
 	var cpuProfileFile *os.File
 	if p.enableCPUProfile {
@@ -164,13 +199,26 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 
 	var samp *sampler.Sampler
 	if p.enableSample {
-		samp = sampler.New(cmd.Process.Pid, 10*time.Millisecond)
+		samp = sampler.New(cmd.Process.Pid, 20*time.Millisecond)
 		sampCtx, sampCancel := context.WithCancel(ctx)
 		go samp.Run(sampCtx)
 		defer func() {
 			sampCancel()
 			samp.Stop()
 		}()
+	}
+
+	var uprobeCounts map[string]uint64
+	var uprobeDetach func()
+	if len(p.uprobeSymbols) > 0 {
+		bin := p.uprobeBinary
+		if bin == "" {
+			bin = command
+		}
+		if counts, detach, err := uprobe.AttachUprobes(bin, p.uprobeSymbols, cmd.Process.Pid); err == nil {
+			uprobeCounts = counts
+			uprobeDetach = detach
+		}
 	}
 
 	procMon := monitor.NewProcessMonitor(int32(cmd.Process.Pid), p.monitorInterval)
@@ -214,20 +262,49 @@ func (p *Profiler) Profile(ctx context.Context, command string, args ...string) 
 		return data, fmt.Errorf("failed to get final stats: %v", err)
 	}
 
+	var wg sync.WaitGroup
 	if cgScope != nil {
-		if st, err := cgScope.ReadStats(); err == nil {
-			data.CgroupStats = &st
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if st, err := cgScope.ReadStats(); err == nil {
+				data.CgroupStats = &st
+			}
+		}()
 	}
-
 	if straceSession != nil {
-		if summary, err := straceSession.Wait(); err == nil {
-			data.SyscallSummary = summary
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if summary, err := straceSession.Wait(); err == nil {
+				data.SyscallSummary = summary
+			}
+		}()
 	}
-
 	if samp != nil {
-		data.TopSyscallsSampled = sampler.TopSyscalls(samp.Samples(), 20)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			data.TopSyscallsSampled = sampler.TopSyscalls(samp.Samples(), 20)
+		}()
+	}
+	if p.enablePreload {
+		wg.Add(1)
+		preloadOutPath := filepath.Join(p.profileDir, "preload_out.txt")
+		go func() {
+			defer wg.Done()
+			if stats, err := preload.ParseOutput(preloadOutPath); err == nil {
+				data.PreloadStats = stats
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(p.uprobeSymbols) > 0 && uprobeDetach != nil {
+		uprobeDetach()
+		if uprobeCounts != nil {
+			data.UprobeCounts = uprobeCounts
+		}
 	}
 
 	if p.enableMemProfile {

@@ -20,6 +20,16 @@ make build
 mirage [options] <command> [args...]
 ```
 
+### Modes
+
+| Mode | Effect |
+|------|--------|
+| **basic** (default) | CPU + memory profiling, process/system metrics, findings. No cgroup, strace, sample, preload, or instrument-go. |
+| **standard** | basic + cgroup (Linux). |
+| **deep** | standard + sample, preload, instrument-go. Full instrumentation where no extra paths are required. Strace is not enabled by default; add `--strace` if you need syscall-level timing (note: strace can cause large slowdowns). |
+
+Use `--mode=basic|standard|deep` or the shorthands `--standard` and `--deep`. Explicit flags override the preset (e.g. `--mode=deep --strace` enables strace). **Note:** `--strace` uses ptrace and can slow the target by 10-100x; use only when you need syscall counts and timing.
+
 ### Basic Examples
 
 ```bash
@@ -38,12 +48,19 @@ mirage -v ./my-application
 
 # Timeout and monitoring frequency
 mirage -timeout 30s -freq 50ms ./batch-job
+
+# Mode presets
+mirage --deep ./myapp
+mirage --mode standard -o report.md python script.py
 ```
 
 ### Key Options
 
 | Option | Description |
 |--------|-------------|
+| `--mode` | Profiling mode: `basic`, `standard`, or `deep` (enables preset options) |
+| `--deep` | Same as `--mode=deep` |
+| `--standard` | Same as `--mode=standard` |
 | `--ui` | Live TUI dashboard while the command runs; report is printed after you press q |
 | `-o <file>` | Write report to file (default: stdout) |
 | `--format` | Report format: `text` or `markdown` (default: text) |
@@ -56,6 +73,8 @@ mirage -timeout 30s -freq 50ms ./batch-job
 | `-timeout <duration>` | Max run time (0 = no limit) |
 | `--no-color` | Disable colored text output |
 | `-h` | Show help |
+
+**Deep / instrumentation** (enabled by `--deep` or individually): `--cgroup`, `--sample`, `--preload`, `--instrument-go`. Optional: `--strace` (heavy slowdown), `--uprobe-symbols`, `--pprof`
 
 ## What You Get
 
@@ -187,6 +206,8 @@ make test     # Run tests
 make install  # Install to $GOPATH/bin
 make run      # Build and run example
 ```
+
+For `--deep` with preload, build the LD_PRELOAD shim so the binary and shim sit together: `make preload` (or `make -C internal/instrument/preload` then copy `preload_shim.so` to the same directory as the mirage binary, or use `--preload-so` to point to the .so).
 
 ## Requirements
 
